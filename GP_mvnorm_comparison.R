@@ -89,7 +89,8 @@ lambda_rbf <- 0.5
 sigma_rbf <- 2
 
 #1D so w can be a vector
-w <- rnorm(N_features, mean=0, sd= 1 / lambda_rbf)
+# w <- rnorm(N_features, mean=0, sd= 1 / lambda_rbf)
+w <- rnorm(N_features) / lambda_rbf
 
 phi <- function(x, w, sigma){
   return(sigma * c(sin(x*w), cos(x*w)) / sqrt(length(w)))

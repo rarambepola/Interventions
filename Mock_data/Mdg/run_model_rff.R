@@ -1,4 +1,5 @@
-args <- commandArgs(trailingOnly=TRUE)
+# args <- commandArgs(trailingOnly=TRUE)
+args <- c("no_selection_bias", 1)
 
 #check if using google cloud
 #check whether on google cloud or not
@@ -30,8 +31,7 @@ print(py_config())
 
 library(ggplot2)
 library(raster)
-library(INLA)
-library(TMB)
+library(randtoolbox)
 
 mock_data_scenario <- args[1]
 
@@ -45,6 +45,7 @@ W <- covs[, 4]
 N <- cluster_size
 N_pos <- cluster_pos
 p_obs <- N_pos / N
+N_obs <- dim(X)[1]
 
 
 emp_logit_mean <- function(p, n){
@@ -95,14 +96,34 @@ for(i in 1:n_obs){
 }
 
 
+#create weights for RFFs
+N_covs <- dim(X)[2]
+N_rff <- 100
+use_RFF <- TRUE
+
+#weights have sd 1 to start with
+w <- matrix(qnorm(halton(N_covs*N_rff)), nrow=N_covs)
+
+#treatment index matrices
+any_index_mat <- matrix(0, nrow=2*N_rff*3, ncol=N_obs)
+treat_index_mat <- any_index_mat
+not_treat_index_mat <- any_index_mat
+treat_index_mat_cf <- any_index_mat
+not_treat_index_mat_cf <- any_index_mat
+any_index_mat[1:(2*N_rff), ] <- 1
+treat_index_mat[2*N_rff + (1:(2*N_rff)), W==1] <- 1
+treat_index_mat_cf[2*N_rff + (1:(2*N_rff)), W==0] <- 1
+not_treat_index_mat[4*N_rff + (1:(2*N_rff)), W==0] <- 1
+not_treat_index_mat_cf[4*N_rff + (1:(2*N_rff)), W==1] <- 1
+
 
 np <- import("numpy")
 torch <- import("torch")
 Variable <-  torch$autograd$Variable
 
-log_beta00 <- Variable(torch$ones(as.integer(1))$add(-1), requires_grad=TRUE)
-log_beta01 <- Variable(torch$ones(as.integer(1))$add(-1), requires_grad=TRUE)
-logit_rho_scale <- Variable(torch$ones(as.integer(1))$add(1), requires_grad=TRUE)
+log_beta00 <- Variable(torch$ones(as.integer(1))$add(1), requires_grad=TRUE)
+log_beta01 <- Variable(torch$ones(as.integer(1))$add(0.5), requires_grad=TRUE)
+logit_rho_scale <- Variable(torch$ones(as.integer(1))$add(-3), requires_grad=TRUE)
 log_lambda <- Variable(torch$ones(as.integer(1)), requires_grad=TRUE)
 log_sigma_0 <- Variable(torch$ones(as.integer(1)), requires_grad=TRUE)
 log_sigma_1 <- Variable(torch$ones(as.integer(1)), requires_grad=TRUE)
@@ -114,6 +135,14 @@ W <- torch$from_numpy(matrix(W))$float()$squeeze()
 W_inv <- torch$from_numpy(matrix(W_inv))$float()$squeeze()
 Y_var <- torch$from_numpy(matrix(Y_var))$float()$squeeze()
 Y <- torch$from_numpy(matrix(Y))$float()$squeeze()
+w <- torch$from_numpy(w)$float()
+X <- torch$from_numpy(X)$float()
+
+any_index_mat <- torch$from_numpy(any_index_mat)$float()
+treat_index_mat <- torch$from_numpy(treat_index_mat)$float()
+not_treat_index_mat <- torch$from_numpy(not_treat_index_mat)$float()
+treat_index_mat_cf <- torch$from_numpy(treat_index_mat_cf)$float()
+not_treat_index_mat_cf <- torch$from_numpy(not_treat_index_mat_cf)$float()
 
 t_t_ind <- torch$from_numpy(t_t_ind)$float()
 nt_nt_ind <- torch$from_numpy(nt_nt_ind)$float()
@@ -150,8 +179,13 @@ compute_var <- function(K_cf_cf, K_obs_cf, K_obs_obs, Sigma_obs){
   return(Var_cf)
 }
 
+compute_var_Rff <- function(X, y, Sigma_inv, X_star, N_features){
+  A <- torch$matmul(torch$matmul(X, Sigma_inv), t_torch(X)) %+_t% torch$diag(torch$ones(as.integer(N_features)))
+  return(torch$trace(torch$matmul(t_torch(X_star), torch$solve(X_star, A)[0])))
+}
+
 #function to compute leave one out prediction
-compute_LOO_pred <- function(j, K_obs_obs, Sigma_obs){
+compute_LOO_pred <- function(j, K_obs_obs, Sigma_obs, Y){
   minus_j_index <- setdiff((0:(n_obs-1)), j-1)
   K_12 <- t_torch(K_obs_obs[minus_j_index])[j-1]
   K_22 <- t_torch(K_obs_obs[minus_j_index])[minus_j_index]
@@ -159,6 +193,23 @@ compute_LOO_pred <- function(j, K_obs_obs, Sigma_obs){
   Y_fit_j <- torch$matmul(K_12$unsqueeze(as.integer(0)), torch$solve(Y[minus_j_index]$unsqueeze(as.integer(1)), Sigma_22)[0])
   return(Y_fit_j)
 }
+
+# A <- X_rff %*% sigma_obs_inv %*% t(X_rff) + diag(N_rff * 2 * N_covs)
+# w_bar_1 <- solve(A, X_rff) %*% sigma_obs_inv %*% Y
+# mean_cf_rff <- t(X_rff_cf) %*% w_bar_1
+
+compute_LOO_pred_rff <- function(j, X, Sigma_inv, Y){
+  minus_j_index <- setdiff((0:(n_obs-1)), j-1)
+  X_use <- t_torch(t_torch(X)[minus_j_index])
+  Sigma_inv <- t_torch(Sigma_inv[minus_j_index])[minus_j_index]
+  X_star <- t_torch(X)[j-1]
+  Y <- Y[minus_j_index]
+  A <- torch$matmul(torch$matmul(X_use, Sigma_inv), t_torch(X_use)) %+_t% torch$diag(torch$ones(as.integer(N_rff * 2 * N_covs)))
+  w_bar <- torch$matmul(torch$matmul(torch$solve(X_use, A)[0], Sigma_inv), Y)
+  mean_pred <- torch$mul(w_bar, X_star)$sum()
+  return(mean_pred)
+}
+
 
 for (i in 1:n_iter) {
   print(i)
@@ -178,38 +229,80 @@ for (i in 1:n_iter) {
   beta012 <- torch$pow(beta01, 2)
   beta002 <- torch$pow(beta00, 2)
   
-  K_obs_obs <- torch$mul(K,
+  if(use_RFF){
+    #make RFFs
+    lambda_sq <- torch$pow(lambda, 0.5)
+    treat_coeff <- torch$pow(torch$sub(beta012, rho), 0.5)
+    not_treat_coeff <- torch$pow(torch$sub(beta002, rho), 0.5)
+    w_use <- torch$div(w, lambda_sq)
+    wX <- t_torch(torch$matmul(X, w_use))
+    X_rff_base <- torch$div(torch$cat(c(torch$sin(wX), torch$cos(wX)), as.integer(0)), sqrt(N_rff))
+    X_rff_base <- torch$cat(c(X_rff_base, X_rff_base, X_rff_base), as.integer(0))
+    X_rff <- torch$mul(torch$mul(X_rff_base, any_index_mat), rho) %+_t% 
+      torch$mul(torch$mul(X_rff_base, treat_index_mat), treat_coeff) %+_t%
+      torch$mul(torch$mul(X_rff_base, not_treat_index_mat), not_treat_coeff)
+    
+    X_rff_cf <- torch$mul(torch$mul(X_rff_base, any_index_mat), rho) %+_t% 
+      torch$mul(torch$mul(X_rff_base, treat_index_mat_cf), treat_coeff) %+_t%
+      torch$mul(torch$mul(X_rff_base, not_treat_index_mat_cf), not_treat_coeff)
+    
+    Sigma_obs_inv <- torch$diag(torch$div(1, torch$mul(torch$add(torch$mul(W_inv, sigma_1), torch$mul(W, sigma_0)), Y_var)))
+    
+    Var_cf <- compute_var_Rff(X_rff, y, Sigma_obs_inv, X_rff_cf, N_rff*2*N_covs)
+    # K_cf_cf <- torch$mul(K, torch$pow(beta01, 2))
+  }else{
+    K_obs_obs <- torch$mul(K,
+                           (torch$mul(t_t_ind, beta012) %+_t% torch$mul(nt_nt_ind, beta002)) %+_t% 
+                             (torch$mul(t_nt_ind, rho) %+_t% torch$mul(nt_t_ind, rho))
+    )
+    
+    K_cf_cf <- torch$mul(K,
                          (torch$mul(t_t_ind, beta002) %+_t% torch$mul(nt_nt_ind, beta012)) %+_t% 
                            (torch$mul(t_nt_ind, rho) %+_t% torch$mul(nt_t_ind, rho))
-  )
+    )
+    
+    K_obs_cf <- torch$mul(K,
+                          (torch$mul(t_t_ind, rho) %+_t% torch$mul(nt_nt_ind, rho)) %+_t% 
+                            (torch$mul(t_nt_ind, beta012) %+_t% torch$mul(nt_t_ind, beta002))
+    )
+    
+    Sigma_cf <- torch$diag(torch$mul(torch$add(torch$mul(W_inv, sigma_0), torch$mul(W, sigma_1)), Y_var))
+    Sigma_obs <- torch$diag(torch$mul(torch$add(torch$mul(W_inv, sigma_1), torch$mul(W, sigma_0)), Y_var))
+    
+    Var_cf <- compute_var(K_cf_cf, t_torch(K_obs_cf), K_obs_obs, Sigma_obs)
+  }
+
   
-  K_cf_cf <- torch$mul(K,
-                       (torch$mul(t_t_ind, beta012) %+_t% torch$mul(nt_nt_ind, beta002)) %+_t% 
-                         (torch$mul(t_nt_ind, rho) %+_t% torch$mul(nt_t_ind, rho))
-  )
-  
-  K_obs_cf <- torch$mul(K,
-                        (torch$mul(t_t_ind, rho) %+_t% torch$mul(nt_nt_ind, rho)) %+_t% 
-                          (torch$mul(t_nt_ind, beta012) %+_t% torch$mul(nt_t_ind, beta002))
-  )
-  
-  # K_cf_cf <- torch$mul(K, torch$pow(beta01, 2))
+
   # K_obs_obs <- torch$mul(K, torch$pow(beta00, 2))
   # K_obs_cf <- torch$mul(K, rho)
-  Sigma_cf <- torch$diag(torch$mul(torch$add(torch$mul(W_inv, sigma_0), torch$mul(W, sigma_1)), Y_var))
-  Sigma_obs <- torch$diag(torch$mul(torch$add(torch$mul(W_inv, sigma_1), torch$mul(W, sigma_0)), Y_var))
+
  
-  Var_cf <- compute_var(K_cf_cf, K_obs_cf, K_obs_obs, Sigma_obs)
+
+  # print(Var_cf)
+  # print(Var_cf_rff)
   
   dist_sum_torch <- torch$zeros(as.integer(1))
-  for(j in 1:n_obs){
-  # for(j in 1:1){
-    cat(j)
-    cat(" ")
-    Y_fit_j <- compute_LOO_pred(j, K_obs_obs, Sigma_obs)
+  # dist_sum_torch_rff <- torch$zeros(as.integer(1))
+  # for(j in 1:n_obs){
+  for(j in 1:10){
+    if(j %% 10 == 0){
+      cat(j)
+      cat(" ")
+    }
+    if(use_RFF){
+      Y_fit_j <- compute_LOO_pred_rff(j, X_rff, Sigma_obs_inv, Y)
+    }else{
+      Y_fit_j <- compute_LOO_pred(j, K_obs_obs, Sigma_obs, Y)
+    }
     dist_sum_torch <- dist_sum_torch$add(torch$pow(torch$add(torch$mul(-1, Y[j-1]), Y_fit_j), 2))
+    # dist_sum_torch_rff <- dist_sum_torch_rff$add(torch$pow(torch$add(torch$mul(-1, Y[j-1]), Y_fit_j_rff), 2))
   }
   cat("\n")
+  
+  # print("dist sum")
+  # print(dist_sum_torch)
+  # print(dist_sum_torch_rff)
   
   param_size <- beta002 %+_t% beta012 %+_t% sigma_0$pow(2) %+_t% 
     sigma_1$pow(2) %+_t% rho$pow(2) %+_t% torch$mul(lambda$pow(2), 3)
